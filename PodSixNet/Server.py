@@ -1,103 +1,92 @@
-import socket
 import sys
+import socket
+import functools
+import asyncio
+from json import loads,dumps
 
-from async import poll, asyncore
-from Channel import Channel
 
-class Server(asyncore.dispatcher):
-	channelClass = Channel
-	
-	def __init__(self, channelClass=None, localaddr=("127.0.0.1", 31425), listeners=5):
-		if channelClass:
-			self.channelClass = channelClass
-		self._map = {}
-		self.channels = []
-		asyncore.dispatcher.__init__(self, map=self._map)
-		self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
-		self.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-		self.set_reuse_addr()
-		self.bind(localaddr)
-		self.listen(listeners)
-	
-	def handle_accept(self):
-		try:
-			conn, addr = self.accept()
-		except socket.error:
-			print 'warning: server accept() threw an exception'
-			return
-		except TypeError:
-			print 'warning: server accept() threw EWOULDBLOCK'
-			return
-		
-		self.channels.append(self.channelClass(conn, addr, self, self._map))
-		self.channels[-1].Send({"action": "connected"})
-		if hasattr(self, "Connected"):
-			self.Connected(self.channels[-1], addr)
-	
-	def Pump(self):
-		[c.Pump() for c in self.channels]
-		poll(map=self._map)
+from PodSixNet.Channel import Channel
 
-#########################
-#	Test stub	#
-#########################
+class ProtocolServer(asyncio.Protocol):
+    # channels must be a static variable since a new ProtocolServer object is created
+    # for each connection
+    channels = []
 
-if __name__ == "__main__":
-	import unittest
-	
-	class ServerTestCase(unittest.TestCase):
-		testdata = {"action": "hello", "data": {"a": 321, "b": [2, 3, 4], "c": ["afw", "wafF", "aa", "weEEW", "w234r"], "d": ["x"] * 256}}
-		def setUp(self):
-			print "ServerTestCase"
-			print "--------------"
-			
-			class ServerChannel(Channel):
-				def Network_hello(self, data):
-					print "*Server* ran test method for 'hello' action"
-					print "*Server* received:", data
-					self._server.received = data
-			
-			class EndPointChannel(Channel):
-				connected = False
-				def Connected(self):
-					print "*EndPoint* Connected()"
-				
-				def Network_connected(self, data):
-					self.connected = True
-					print "*EndPoint* Network_connected(", data, ")"
-					print "*EndPoint* initiating send"
-					self.Send(ServerTestCase.testdata)
-			
-			class TestServer(Server):
-				connected = False
-				received = None
-				def Connected(self, channel, addr):
-					self.connected = True
-					print "*Server* Connected() ", channel, "connected on", addr
-			
-			self.server = TestServer(channelClass=ServerChannel)
-			
-			sender = asyncore.dispatcher(map=self.server._map)
-			sender.create_socket(socket.AF_INET, socket.SOCK_STREAM)
-			sender.connect(("localhost", 31425))
-			self.outgoing = EndPointChannel(sender, map=self.server._map)
-			
-		def runTest(self):
-			from time import sleep
-			print "*** polling for half a second"
-			for x in range(250):
-				self.server.Pump()
-				self.outgoing.Pump()
-				if self.server.received:
-					self.failUnless(self.server.received == self.testdata)
-					self.server.received = None
-				sleep(0.001)
-			self.failUnless(self.server.connected == True, "Server is not connected")
-			self.failUnless(self.outgoing.connected == True, "Outgoing socket is not connected")
-		
-		def tearDown(self):
-			pass
-			del self.server
-			del self.outgoing
-	
-	unittest.main()
+    def __init__(self, loop, channelClass=Channel, localaddr=("127.0.0.1", 31425), listeners=5):
+        """__init__
+
+        Args:
+            loop: asyncio event loop
+            channelClass: class to use for channels
+            localaddr: where to serve this server at
+            listeners: how many clients we can keep in our backlog (see accept(2))
+        """
+        self.loop = loop
+        if channelClass:
+            self.channelClass = channelClass
+        else:
+            raise TypeError("channelClass is type None")
+        self.client_ip = None
+        self.client_port = None
+        self._need_pump = False
+
+
+    def _find_channel(self, ip, port):
+        """Finds and returns the channel with the requested ip & port"""
+        for c in ProtocolServer.channels:
+            if c.ip == ip and c.port == port:
+                return c
+        return None
+    
+
+    def connection_made(self, transport):
+        """This implements the abstract callback from asyncio.Protocol"""
+        # Create and store the client as a client Channel
+        self.client_ip, self.client_port = transport.get_extra_info('peername')
+        ProtocolServer.channels.append(self.channelClass(self.loop, self, self.client_ip, self.client_port, transport))
+
+        # Send connected action over to client
+        ProtocolServer.channels[-1].Send({"action": "connected"})
+
+        # Call channel callback if it exists
+        ProtocolServer.channels[-1].handle_connect()
+
+        # Call own Connected() callback if it exists
+        if hasattr(self, "Connected"):
+            self.Connected(ProtocolServer.channels[-1], (self.client_ip, self.client_port))
+
+
+    def connection_lost(self, exc):
+        """This implements the abstract callback from asyncio.Protocol"""
+        c = self._find_channel(self.client_ip, self.client_port)
+
+        # exc is None if it's a regular close, otherwise it's an execption
+        if exc:
+            c.handle_expt(exc)
+        else:
+            c.handle_close()
+            ProtocolServer.channels.remove(c)
+
+
+    def eof_received(self):
+        """This implements the abstract callback from asyncio.Protocol
+        
+        This is called when the other end has send an EOF signalling they won't
+        be sending any more data"""
+        # Clean up our end of the connection
+        # Note that we are reusing a callback here. Not sure if that's a good idea
+        self.connection_lost(None)
+
+        # By returning None here, we close the connection
+        return None
+
+
+    def data_received(self, data):
+        """This implements the abstract callback from asyncio.Protocol"""
+        c = self._find_channel(self.client_ip, self.client_port)
+        c.store_incoming_data(data.decode())
+        self.loop.call_soon(self.Pump)
+         
+
+    def Pump(self):
+        [c.Pump() for c in ProtocolServer.channels]
